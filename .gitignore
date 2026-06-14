@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Datos y modelos (no subir a git — van a S3)
+data/
+*.pth
+*.pt
+*.ckpt
+
+# Outputs
+outputs/
+wandb/
+lightning_logs/
+
+# Misc
+.DS_Store
+.env
+.claude/
