@@ -13,7 +13,6 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import requests
 from tqdm import tqdm
 
 RAW_DIR = Path("data/raw")
@@ -24,15 +23,9 @@ N_FOLDS = 5
 TEST_RATIO = 0.1
 SEED = 42
 
-# URL pública del dataset raw (2015 Skill Builder)
-DATA_URL = (
-    "https://raw.githubusercontent.com/theophilee/learner-performance-prediction"
-    "/master/data/assistments/ASSISTments_skill_builder_data.csv"
-)
-FALLBACK_URL = (
-    "https://raw.githubusercontent.com/arghosh/AKT"
-    "/master/data/assist2015.csv"
-)
+# Google Drive file ID oficial de ASSISTments 2015 Skill Builder
+# Fuente: https://sites.google.com/site/assistmentsdata/datasets/2015-assistments-skill-builder-data
+GDRIVE_FILE_ID = "0B_hO8cnpcIMgUGZzRnh3bHJrSjQ"
 
 
 def download_raw():
@@ -42,24 +35,23 @@ def download_raw():
         print(f"Dataset crudo ya existe: {raw_path}")
         return raw_path
 
-    for url in [DATA_URL, FALLBACK_URL]:
-        print(f"Descargando desde {url} ...")
-        try:
-            r = requests.get(url, stream=True, timeout=30)
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0))
-            with open(raw_path, "wb") as f, tqdm(total=total, unit="B", unit_scale=True) as bar:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
-                    bar.update(len(chunk))
+    print("Descargando ASSISTments 2015 desde Google Drive...")
+    try:
+        import gdown
+        gdown.download(
+            f"https://drive.google.com/uc?id={GDRIVE_FILE_ID}",
+            str(raw_path),
+            quiet=False,
+        )
+        if raw_path.exists() and raw_path.stat().st_size > 1000:
             print(f"Descargado: {raw_path}")
             return raw_path
-        except Exception as e:
-            print(f"Falló {url}: {e}")
+    except Exception as e:
+        print(f"gdown falló: {e}")
 
     print("\nNo se pudo descargar automáticamente.")
-    print("Descarga manualmente 'ASSISTments_skill_builder_data.csv' y colócalo en data/raw/assist2015.csv")
-    print("Fuente: https://sites.google.com/site/assistmentsdata/home/2015-assistments-skill-builder-data")
+    print("Descarga manualmente el archivo y colócalo en data/raw/assist2015.csv")
+    print("Fuente: https://sites.google.com/site/assistmentsdata/datasets/2015-assistments-skill-builder-data")
     raise SystemExit(1)
 
 
