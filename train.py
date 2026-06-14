@@ -11,8 +11,19 @@ Luego subir a S3:
     aws s3 cp outputs/sakt_assist2015.pth s3://sward-models/sakt/v1.0/model.pth
 """
 
+# pyKT tiene un bug: qdkt.py importa turtle (requiere Tk/tkinter).
+# Este mock lo neutraliza antes de que pyKT cargue.
+import sys
+import types as _types
+
+if "turtle" not in sys.modules:
+    _turtle_mock = _types.ModuleType("turtle")
+    _turtle_mock.forward = lambda *a, **kw: None
+    sys.modules["turtle"] = _turtle_mock
+
 import json
 import os
+import time
 from pathlib import Path
 
 import torch
@@ -144,15 +155,16 @@ def extract_batch(batch):
     return q, r, qry, target, mask
 
 
-def train_epoch(model, loader, optimizer, criterion):
+def train_epoch(model, loader, optimizer, criterion, epoch: int):
     model.train()
     total_loss, all_preds, all_targets = 0.0, [], []
+    t0 = time.time()
 
-    for batch in tqdm(loader, desc="Train", leave=False):
+    bar = tqdm(loader, desc=f"  Epoch {epoch:02d} [train]", unit="batch", dynamic_ncols=True)
+    for step, batch in enumerate(bar, 1):
         q, r, qry, target, mask = extract_batch(batch)
 
         optimizer.zero_grad()
-        # pyKT SAKT devuelve (y, reg_loss) — y son probabilidades (post-sigmoid)
         y, reg_loss = model(q, r, qry)
 
         active_y = y[mask]
@@ -167,16 +179,21 @@ def train_epoch(model, loader, optimizer, criterion):
         all_preds.extend(active_y.detach().cpu().numpy())
         all_targets.extend(active_t.cpu().numpy())
 
+        if step % 20 == 0:
+            running_auc = roc_auc_score(all_targets, all_preds) if len(set(all_targets)) > 1 else 0.0
+            bar.set_postfix(loss=f"{total_loss/step:.4f}", auc=f"{running_auc:.4f}")
+
+    elapsed = time.time() - t0
     auc = roc_auc_score(all_targets, all_preds) if len(set(all_targets)) > 1 else 0.0
-    return total_loss / len(loader), auc
+    return total_loss / len(loader), auc, elapsed
 
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion):
+def eval_epoch(model, loader, criterion, desc="[eval]"):
     model.eval()
     total_loss, all_preds, all_targets = 0.0, [], []
 
-    for batch in tqdm(loader, desc="Eval", leave=False):
+    for batch in tqdm(loader, desc=f"  {desc}", unit="batch", dynamic_ncols=True, leave=False):
         q, r, qry, target, mask = extract_batch(batch)
 
         y, reg_loss = model(q, r, qry)
@@ -214,15 +231,24 @@ def main():
     patience_counter = 0
     best_model_path = OUTPUT_DIR / "sakt_assist2015.pth"
 
+    train_start = time.time()
     for epoch in range(1, EPOCHS + 1):
-        train_loss, train_auc = train_epoch(model, train_loader, optimizer, criterion)
-        val_loss, val_auc = eval_epoch(model, valid_loader, criterion)
+        train_loss, train_auc, t_elapsed = train_epoch(model, train_loader, optimizer, criterion, epoch)
+        val_loss, val_auc = eval_epoch(model, valid_loader, criterion, desc="[val]  ")
         scheduler.step(val_loss)
 
+        epochs_done = epoch
+        epochs_left = EPOCHS - epoch
+        avg_epoch_time = (time.time() - train_start) / epochs_done
+        eta_sec = avg_epoch_time * epochs_left
+        eta_str = f"{int(eta_sec // 60)}m{int(eta_sec % 60):02d}s"
+
+        marker = "✓ MEJOR" if val_auc > best_val_auc else f"  (sin mejora {patience_counter+1}/{PATIENCE})"
         print(
             f"Epoch {epoch:02d}/{EPOCHS} | "
-            f"Train loss={train_loss:.4f} AUC={train_auc:.4f} | "
-            f"Val loss={val_loss:.4f} AUC={val_auc:.4f}"
+            f"train loss={train_loss:.4f} AUC={train_auc:.4f} | "
+            f"val loss={val_loss:.4f} AUC={val_auc:.4f} | "
+            f"{t_elapsed:.0f}s/ep | ETA {eta_str} | {marker}"
         )
 
         if val_auc > best_val_auc:
@@ -242,17 +268,19 @@ def main():
                 },
                 best_model_path,
             )
-            print(f"  ✓ Mejor modelo guardado (val_auc={val_auc:.4f})")
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                print(f"\nEarly stopping en epoch {epoch}")
+                print(f"\nEarly stopping en epoch {epoch} — no mejoró en {PATIENCE} epochs.")
                 break
+
+    total_time = time.time() - train_start
+    print(f"\nEntrenamiento completado en {int(total_time // 60)}m{int(total_time % 60):02d}s")
 
     # Evaluación final en test
     checkpoint = torch.load(best_model_path, map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
-    test_loss, test_auc = eval_epoch(model, test_loader, criterion)
+    test_loss, test_auc = eval_epoch(model, test_loader, criterion, desc="[test] ")
 
     print(f"\n=== Resultado final ===")
     print(f"Test AUC: {test_auc:.4f}  (esperado: ~0.74-0.76)")
