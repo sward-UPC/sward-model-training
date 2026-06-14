@@ -2,27 +2,23 @@
 Entrenamiento SAKT con ASSISTments 2015 usando pyKT.
 
 Uso:
+    python prepare_data.py   ← solo la primera vez
     python train.py
 
-El modelo entrenado se guarda en outputs/sakt_assist2015.pth
-Luego subir a S3:
-    python upload_s3.py
-    # o manualmente:
-    aws s3 cp outputs/sakt_assist2015.pth s3://sward-models/sakt/v1.0/model.pth
+El modelo se guarda en outputs/sakt_assist2015.pth
+Siguiente paso: python upload_s3.py
 """
 
-# pyKT tiene un bug: qdkt.py importa turtle (requiere Tk/tkinter).
-# Este mock lo neutraliza antes de que pyKT cargue.
+# pyKT bug: qdkt.py importa turtle (requiere Tk). Mock antes de que pyKT cargue.
 import sys
 import types as _types
 
 if "turtle" not in sys.modules:
-    _turtle_mock = _types.ModuleType("turtle")
-    _turtle_mock.forward = lambda *a, **kw: None
-    sys.modules["turtle"] = _turtle_mock
+    _mock = _types.ModuleType("turtle")
+    _mock.forward = lambda *a, **kw: None
+    sys.modules["turtle"] = _mock
 
 import json
-import os
 import time
 from pathlib import Path
 
@@ -30,6 +26,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import roc_auc_score
 from torch.optim import Adam
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ── Device ────────────────────────────────────────────────────────────────────
@@ -44,6 +41,7 @@ print(f"Dispositivo: {DEVICE}")
 
 # ── Hiperparámetros ───────────────────────────────────────────────────────────
 DATASET = "assist2015"
+DATA_DIR = Path("data/assist2015")
 SEQ_LEN = 200
 EMB_SIZE = 256
 NUM_HEADS = 8
@@ -53,57 +51,49 @@ BATCH_SIZE = 64
 EPOCHS = 30
 LR = 1e-3
 PATIENCE = 5
+N_FOLDS = 5          # fold 0..4 → usamos fold 4 como validación
 
 OUTPUT_DIR = Path("outputs")
-DATA_DIR = Path("data")
 OUTPUT_DIR.mkdir(exist_ok=True)
-DATA_DIR.mkdir(exist_ok=True)
+
+PAD = -1
 
 
-# ── Preprocesamiento de datos ─────────────────────────────────────────────────
-def prepare_data():
-    """Descarga y preprocesa ASSISTments 2015 con pyKT."""
-    from pykt.datasets.data_preprocess import process_raw_data
+# ── Metadatos del dataset ─────────────────────────────────────────────────────
+def get_n_skills() -> int:
+    import pandas as pd
 
-    dataset_dir = DATA_DIR / DATASET
-    train_file = dataset_dir / "train_valid_sequences.csv"
-
-    if not train_file.exists():
-        print(f"Preprocesando {DATASET} con pyKT...")
-        dataset_dir.mkdir(parents=True, exist_ok=True)
-        process_raw_data(DATASET, str(dataset_dir))
-        print("Preprocesamiento completado.")
-    else:
-        print(f"Datos ya preprocesados en {dataset_dir}")
-
-    return str(dataset_dir)
+    df = pd.read_csv(DATA_DIR / "train_valid_sequences.csv")
+    skills = set()
+    for row in df["concepts"]:
+        for x in str(row).split(","):
+            x = x.strip()
+            if x and x != str(PAD):
+                skills.add(int(x))
+    return max(skills) + 1
 
 
-# ── DataLoaders (pyKT) ────────────────────────────────────────────────────────
-def get_loaders(data_dir: str):
-    """Inicializa los DataLoaders usando pyKT."""
-    from pykt.datasets.init_dataset import init_dataset4train
+# ── DataLoaders via pyKT ──────────────────────────────────────────────────────
+def get_loaders(n_skills: int):
+    from pykt.datasets.data_loader import KTDataset
 
-    loaders = init_dataset4train(
-        dataset_name=DATASET,
-        model_name="sakt",
-        dpath=data_dir,
-        fname="train_valid_sequences.csv",
-        emb_type="qid",
-        seq_len=SEQ_LEN,
-        train_ratio=0.8,
-        val_ratio=0.1,
-        test_ratio=0.1,
-        batch_size=BATCH_SIZE,
-    )
-    # init_dataset4train devuelve: train, valid, test, test_window (y a veces más)
-    train_loader, valid_loader, test_loader = loaders[0], loaders[1], loaders[2]
+    train_file = str(DATA_DIR / "train_valid_sequences.csv")
+    test_file = str(DATA_DIR / "test_sequences.csv")
+
+    # Folds 0-3 → train, fold 4 → validación
+    train_ds = KTDataset(train_file, input_type=["concepts"], folds=set(range(N_FOLDS - 1)))
+    valid_ds = KTDataset(train_file, input_type=["concepts"], folds={N_FOLDS - 1})
+    test_ds = KTDataset(test_file, input_type=["concepts"], folds={-1})
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
+
     return train_loader, valid_loader, test_loader
 
 
-# ── Modelo (pyKT SAKT) ────────────────────────────────────────────────────────
+# ── Modelo SAKT (pyKT) ────────────────────────────────────────────────────────
 def build_model(n_skills: int):
-    """Instancia el modelo SAKT de pyKT."""
     from pykt.models.sakt import SAKT
 
     model = SAKT(
@@ -118,53 +108,29 @@ def build_model(n_skills: int):
     return model.to(DEVICE)
 
 
-# ── Loop de entrenamiento ─────────────────────────────────────────────────────
-def get_n_skills(data_dir: str) -> int:
-    """Lee el número de skills del archivo de metadatos generado por pyKT."""
-    import pandas as pd
-
-    meta_path = Path(data_dir) / "keyid2idx.json"
-    if meta_path.exists():
-        with open(meta_path) as f:
-            meta = json.load(f)
-        return len(meta.get("concepts", meta))
-
-    # Fallback: leer del CSV
-    df = pd.read_csv(Path(data_dir) / "train_valid_sequences.csv")
-    all_skills = []
-    for row in df["concepts"]:
-        all_skills.extend([int(x) for x in str(row).split(",") if x.strip()])
-    return max(all_skills) + 1
-
-
-def extract_batch(batch):
-    """
-    Extrae tensores del batch de pyKT.
-    pyKT devuelve un dict 'dcur' con las secuencias.
-    """
-    dcur = batch
-    if isinstance(batch, (list, tuple)):
-        dcur = batch[0]
-
-    q = dcur.get("qseqs", dcur.get("questions")).long().to(DEVICE)
-    r = dcur.get("rseqs", dcur.get("responses")).long().to(DEVICE)
-    qry = dcur.get("qshfseqs", q).long().to(DEVICE)       # query: pregunta siguiente
-    target = dcur.get("rshfseqs", r).float().to(DEVICE)   # target: respuesta siguiente
-    mask = dcur.get("smasks", torch.ones_like(r, dtype=torch.bool)).bool().to(DEVICE)
-
+# ── Extracción de batch (formato pyKT KTDataset) ──────────────────────────────
+def extract_batch(dcur):
+    # KTDataset devuelve dict con claves: cseqs, rseqs, shft_cseqs, shft_rseqs, masks, smasks
+    q = dcur["cseqs"].long().to(DEVICE)          # conceptos pasados
+    r = dcur["rseqs"].long().to(DEVICE)          # respuestas pasadas (float en pyKT, pero usamos long)
+    qry = dcur["shft_cseqs"].long().to(DEVICE)   # concepto siguiente (query)
+    target = dcur["shft_rseqs"].float().to(DEVICE)
+    mask = dcur["smasks"].bool().to(DEVICE)
     return q, r, qry, target, mask
 
 
+# ── Epoch de entrenamiento ────────────────────────────────────────────────────
 def train_epoch(model, loader, optimizer, criterion, epoch: int):
     model.train()
     total_loss, all_preds, all_targets = 0.0, [], []
     t0 = time.time()
 
     bar = tqdm(loader, desc=f"  Epoch {epoch:02d} [train]", unit="batch", dynamic_ncols=True)
-    for step, batch in enumerate(bar, 1):
-        q, r, qry, target, mask = extract_batch(batch)
+    for step, dcur in enumerate(bar, 1):
+        q, r, qry, target, mask = extract_batch(dcur)
 
         optimizer.zero_grad()
+        # pyKT SAKT.forward devuelve (y, reg_loss); y ya tiene sigmoid aplicado
         y, reg_loss = model(q, r, qry)
 
         active_y = y[mask]
@@ -179,8 +145,8 @@ def train_epoch(model, loader, optimizer, criterion, epoch: int):
         all_preds.extend(active_y.detach().cpu().numpy())
         all_targets.extend(active_t.cpu().numpy())
 
-        if step % 20 == 0:
-            running_auc = roc_auc_score(all_targets, all_preds) if len(set(all_targets)) > 1 else 0.0
+        if step % 20 == 0 and len(set(all_targets)) > 1:
+            running_auc = roc_auc_score(all_targets, all_preds)
             bar.set_postfix(loss=f"{total_loss/step:.4f}", auc=f"{running_auc:.4f}")
 
     elapsed = time.time() - t0
@@ -188,13 +154,14 @@ def train_epoch(model, loader, optimizer, criterion, epoch: int):
     return total_loss / len(loader), auc, elapsed
 
 
+# ── Epoch de evaluación ───────────────────────────────────────────────────────
 @torch.no_grad()
 def eval_epoch(model, loader, criterion, desc="[eval]"):
     model.eval()
     total_loss, all_preds, all_targets = 0.0, [], []
 
-    for batch in tqdm(loader, desc=f"  {desc}", unit="batch", dynamic_ncols=True, leave=False):
-        q, r, qry, target, mask = extract_batch(batch)
+    for dcur in tqdm(loader, desc=f"  {desc}", unit="batch", dynamic_ncols=True, leave=False):
+        q, r, qry, target, mask = extract_batch(dcur)
 
         y, reg_loss = model(q, r, qry)
         active_y = y[mask]
@@ -212,43 +179,44 @@ def eval_epoch(model, loader, criterion, desc="[eval]"):
 def main():
     print("=== Entrenamiento SAKT — ASSISTments 2015 ===\n")
 
-    data_dir = prepare_data()
-    n_skills = get_n_skills(data_dir)
-    print(f"Skills únicos: {n_skills}\n")
+    if not (DATA_DIR / "train_valid_sequences.csv").exists():
+        print("Datos no encontrados. Ejecuta primero: python prepare_data.py")
+        raise SystemExit(1)
 
-    train_loader, valid_loader, test_loader = get_loaders(data_dir)
+    n_skills = get_n_skills()
+    print(f"Skills únicos: {n_skills}")
+
+    train_loader, valid_loader, test_loader = get_loaders(n_skills)
+    print(f"Batches — train: {len(train_loader)}, val: {len(valid_loader)}, test: {len(test_loader)}\n")
 
     model = build_model(n_skills)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parámetros del modelo: {total_params:,}\n")
 
     optimizer = Adam(model.parameters(), lr=LR, weight_decay=1e-5)
-    # pyKT SAKT ya aplica sigmoid, usamos BCELoss (no BCEWithLogitsLoss)
-    criterion = nn.BCELoss()
+    criterion = nn.BCELoss()  # pyKT SAKT ya aplica sigmoid
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
 
     best_val_auc = 0.0
     patience_counter = 0
     best_model_path = OUTPUT_DIR / "sakt_assist2015.pth"
-
     train_start = time.time()
+
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_auc, t_elapsed = train_epoch(model, train_loader, optimizer, criterion, epoch)
         val_loss, val_auc = eval_epoch(model, valid_loader, criterion, desc="[val]  ")
         scheduler.step(val_loss)
 
-        epochs_done = epoch
-        epochs_left = EPOCHS - epoch
-        avg_epoch_time = (time.time() - train_start) / epochs_done
-        eta_sec = avg_epoch_time * epochs_left
+        avg_time = (time.time() - train_start) / epoch
+        eta_sec = avg_time * (EPOCHS - epoch)
         eta_str = f"{int(eta_sec // 60)}m{int(eta_sec % 60):02d}s"
+        marker = "✓ MEJOR" if val_auc > best_val_auc else f"  sin mejora {patience_counter + 1}/{PATIENCE}"
 
-        marker = "✓ MEJOR" if val_auc > best_val_auc else f"  (sin mejora {patience_counter+1}/{PATIENCE})"
         print(
             f"Epoch {epoch:02d}/{EPOCHS} | "
             f"train loss={train_loss:.4f} AUC={train_auc:.4f} | "
             f"val loss={val_loss:.4f} AUC={val_auc:.4f} | "
-            f"{t_elapsed:.0f}s/ep | ETA {eta_str} | {marker}"
+            f"{t_elapsed:.0f}s | ETA {eta_str} | {marker}"
         )
 
         if val_auc > best_val_auc:
@@ -271,22 +239,20 @@ def main():
         else:
             patience_counter += 1
             if patience_counter >= PATIENCE:
-                print(f"\nEarly stopping en epoch {epoch} — no mejoró en {PATIENCE} epochs.")
+                print(f"\nEarly stopping en epoch {epoch}.")
                 break
 
     total_time = time.time() - train_start
     print(f"\nEntrenamiento completado en {int(total_time // 60)}m{int(total_time % 60):02d}s")
 
-    # Evaluación final en test
     checkpoint = torch.load(best_model_path, map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
     test_loss, test_auc = eval_epoch(model, test_loader, criterion, desc="[test] ")
 
     print(f"\n=== Resultado final ===")
     print(f"Test AUC: {test_auc:.4f}  (esperado: ~0.74-0.76)")
-    print(f"Modelo: {best_model_path}")
-    print(f"\nSiguiente paso:")
-    print(f"  python upload_s3.py")
+    print(f"Modelo guardado: {best_model_path}")
+    print(f"\nSiguiente paso: python upload_s3.py")
 
     meta = {
         "dataset": DATASET,
@@ -301,7 +267,6 @@ def main():
     }
     with open(OUTPUT_DIR / "model_meta.json", "w") as f:
         json.dump(meta, f, indent=2)
-    print(f"Metadatos: {OUTPUT_DIR}/model_meta.json")
 
 
 if __name__ == "__main__":
