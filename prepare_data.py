@@ -74,12 +74,17 @@ def preprocess(raw_path: Path) -> int:
     # Normalizar nombres de columnas
     df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
 
-    # Detectar columnas relevantes
-    user_col = next(c for c in df.columns if "user" in c and "id" in c)
-    skill_col = next((c for c in df.columns if "skill_id" in c or "kc_id" in c), None)
+    # Columnas del dataset 2015 Skill Builder: user_id, log_id, sequence_id, correct
+    # sequence_id es el identificador de habilidad (skill builder)
+    user_col = next(c for c in df.columns if "user" in c)
+    skill_col = next(
+        (c for c in df.columns if c in ("skill_id", "kc_id", "sequence_id", "problem_id")),
+        None,
+    )
     if skill_col is None:
-        skill_col = next(c for c in df.columns if "skill" in c)
+        skill_col = next(c for c in df.columns if "skill" in c or "sequence" in c or "problem" in c)
     correct_col = next(c for c in df.columns if "correct" in c)
+    print(f"Columnas usadas → usuario: {user_col}, habilidad: {skill_col}, correcto: {correct_col}")
 
     df = df[[user_col, skill_col, correct_col]].dropna()
     df[skill_col] = df[skill_col].astype(float).astype(int)
