@@ -9,7 +9,7 @@ El modelo se guarda en outputs/sakt_assist2015.pth
 Siguiente paso: python upload_s3.py
 """
 
-# pyKT bug: qdkt.py importa turtle (requiere Tk). Mock antes de que pyKT cargue.
+# pyKT bug 1: qdkt.py importa turtle (requiere Tk). Mock antes de que pyKT cargue.
 import sys
 import types as _types
 
@@ -17,6 +17,14 @@ if "turtle" not in sys.modules:
     _mock = _types.ModuleType("turtle")
     _mock.forward = lambda *a, **kw: None
     sys.modules["turtle"] = _mock
+
+# pyKT bug 2: data_loader.py usa torch.cuda.LongTensor/FloatTensor aunque no haya CUDA.
+# En Apple Silicon (MPS) CUDA no está disponible → fallback a tensores CPU.
+import torch as _torch
+
+if not _torch.cuda.is_available():
+    _torch.cuda.LongTensor = _torch.LongTensor
+    _torch.cuda.FloatTensor = _torch.FloatTensor
 
 import json
 import time
