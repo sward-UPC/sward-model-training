@@ -18,13 +18,6 @@ if "turtle" not in sys.modules:
     _mock.forward = lambda *a, **kw: None
     sys.modules["turtle"] = _mock
 
-# pyKT bug 2: data_loader.py usa torch.cuda.LongTensor/FloatTensor aunque no haya CUDA.
-# En Apple Silicon (MPS) CUDA no está disponible → fallback a tensores CPU.
-import torch as _torch
-
-if not _torch.cuda.is_available():
-    _torch.cuda.LongTensor = _torch.LongTensor
-    _torch.cuda.FloatTensor = _torch.FloatTensor
 
 import json
 import time
@@ -81,17 +74,60 @@ def get_n_skills() -> int:
     return max(skills) + 1
 
 
-# ── DataLoaders via pyKT ──────────────────────────────────────────────────────
-def get_loaders(n_skills: int):
-    from pykt.datasets.data_loader import KTDataset
+# ── Dataset propio (mismo formato CSV que pyKT, sin torch.cuda) ───────────────
+class KTDatasetCPU(torch.utils.data.Dataset):
+    """
+    Lee los CSV generados por prepare_data.py en el formato que espera pyKT
+    (columnas: fold, concepts, responses, selectmasks) pero usa tensores CPU.
+    Compatible con el SAKT de pyKT: devuelve el mismo dict dcur.
+    """
 
+    def __init__(self, file_path: str, folds: set):
+        import pandas as pd
+
+        df = pd.read_csv(file_path)
+        df = df[df["fold"].isin(folds)]
+
+        self.cseqs, self.rseqs, self.smasks = [], [], []
+        for _, row in df.iterrows():
+            c = [int(x) for x in str(row["concepts"]).split(",")]
+            r = [int(x) for x in str(row["responses"]).split(",")]
+            s = [int(x) for x in str(row["selectmasks"]).split(",")]
+            self.cseqs.append(c)
+            self.rseqs.append(r)
+            self.smasks.append(s)
+
+        self.cseqs = torch.LongTensor(self.cseqs)
+        self.rseqs = torch.FloatTensor(self.rseqs)
+        self.smasks = torch.LongTensor(self.smasks)
+        # mask: ambas posiciones (t y t+1) deben ser válidas (≠ PAD)
+        self.masks = (self.cseqs[:, :-1] != PAD) & (self.cseqs[:, 1:] != PAD)
+        # smasks: posiciones a evaluar (1 = válido)
+        self.smasks = (self.smasks[:, 1:] != PAD)
+
+    def __len__(self):
+        return len(self.cseqs)
+
+    def __getitem__(self, idx):
+        # pyKT KTDataset devuelve dcur con pares (t, t+1) ya shiftados
+        return {
+            "cseqs":      self.cseqs[idx, :-1] * self.masks[idx],
+            "rseqs":      self.rseqs[idx, :-1] * self.masks[idx],
+            "shft_cseqs": self.cseqs[idx, 1:]  * self.masks[idx],
+            "shft_rseqs": self.rseqs[idx, 1:]  * self.masks[idx],
+            "masks":      self.masks[idx],
+            "smasks":     self.smasks[idx],
+        }
+
+
+# ── DataLoaders ───────────────────────────────────────────────────────────────
+def get_loaders(n_skills: int):
     train_file = str(DATA_DIR / "train_valid_sequences.csv")
     test_file = str(DATA_DIR / "test_sequences.csv")
 
-    # Folds 0-3 → train, fold 4 → validación
-    train_ds = KTDataset(train_file, input_type=["concepts"], folds=set(range(N_FOLDS - 1)))
-    valid_ds = KTDataset(train_file, input_type=["concepts"], folds={N_FOLDS - 1})
-    test_ds = KTDataset(test_file, input_type=["concepts"], folds={-1})
+    train_ds = KTDatasetCPU(train_file, folds=set(range(N_FOLDS - 1)))
+    valid_ds = KTDatasetCPU(train_file, folds={N_FOLDS - 1})
+    test_ds = KTDatasetCPU(test_file, folds={-1})
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False)
