@@ -139,6 +139,12 @@ def get_loaders(n_skills: int):
 # ── Modelo SAKT (pyKT) ────────────────────────────────────────────────────────
 def build_model(n_skills: int):
     from pykt.models.sakt import SAKT
+    import pykt.models.utils as _pykt_utils
+
+    # pyKT calcula device como "cpu"/"cuda" sin saber de MPS.
+    # Parcheamos la variable de módulo para que pos_encode y ut_mask
+    # generen tensores en el mismo device que el modelo.
+    _pykt_utils.device = str(DEVICE)
 
     model = SAKT(
         num_c=n_skills,
@@ -174,13 +180,13 @@ def train_epoch(model, loader, optimizer, criterion, epoch: int):
         q, r, qry, target, mask = extract_batch(dcur)
 
         optimizer.zero_grad()
-        # pyKT SAKT.forward devuelve (y, reg_loss); y ya tiene sigmoid aplicado
-        y, reg_loss = model(q, r, qry)
+        # pyKT SAKT.forward devuelve solo p (ya con sigmoid); qtest=False
+        y = model(q, r, qry)
 
         active_y = y[mask]
         active_t = target[mask]
 
-        loss = criterion(active_y, active_t) + reg_loss
+        loss = criterion(active_y, active_t)
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
@@ -207,7 +213,7 @@ def eval_epoch(model, loader, criterion, desc="[eval]"):
     for dcur in tqdm(loader, desc=f"  {desc}", unit="batch", dynamic_ncols=True, leave=False):
         q, r, qry, target, mask = extract_batch(dcur)
 
-        y, reg_loss = model(q, r, qry)
+        y = model(q, r, qry)
         active_y = y[mask]
         active_t = target[mask]
 
