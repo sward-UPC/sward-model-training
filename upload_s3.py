@@ -2,32 +2,35 @@
 Sube el modelo entrenado a S3.
 
 Uso:
-    python upload_s3.py
-    python upload_s3.py --version v2.0
+    python upload_s3.py                         # assist2015 → sakt/assist2015/
+    python upload_s3.py --dataset moodle        # sakt_moodle.pth → sakt/moodle/
+    python upload_s3.py --dataset moodle --version v2  # → sakt/v2/
 """
 
 import argparse
-import json
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
 BUCKET = "sward-models"
-DEFAULT_VERSION = "v1.0"
-MODEL_PATH = Path("outputs/sakt_assist2015.pth")
-META_PATH = Path("outputs/model_meta.json")
+OUTPUTS = Path("outputs")
 
 
-def upload(version: str):
-    if not MODEL_PATH.exists():
-        print(f"No se encontró el modelo en {MODEL_PATH}. Ejecuta train.py primero.")
+def upload(dataset: str, version: str) -> None:
+    model_path = OUTPUTS / f"sakt_{dataset}.pth"
+    if not model_path.exists():
+        print(f"No se encontró el modelo en {model_path}. Ejecuta train.py primero.")
         return
 
     s3 = boto3.client("s3")
     prefix = f"sakt/{version}"
-
-    for local, s3_key in [(MODEL_PATH, f"{prefix}/model.pth"), (META_PATH, f"{prefix}/model_meta.json")]:
+    archivos = [
+        (model_path, f"{prefix}/model.pth"),
+        (OUTPUTS / f"sakt_{dataset}_traced.pt", f"{prefix}/model_traced.pt"),
+        (OUTPUTS / "model_meta.json", f"{prefix}/model_meta.json"),
+    ]
+    for local, s3_key in archivos:
         if not local.exists():
             continue
         try:
@@ -38,11 +41,12 @@ def upload(version: str):
             return
 
     print(f"\nModelo disponible en: s3://{BUCKET}/{prefix}/model.pth")
-    print("ms-recomendacion lo cargará automáticamente al reiniciar.")
+    print("Apunta SAKT_MODEL_S3_KEY a esa key en ms-recomendacion y redeploy.")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--version", default=DEFAULT_VERSION, help="Versión del modelo (ej: v1.0)")
+    parser.add_argument("--dataset", default="assist2015", help="Dataset del modelo (assist2015 | moodle)")
+    parser.add_argument("--version", default=None, help="Prefijo en S3 (default: = dataset)")
     args = parser.parse_args()
-    upload(args.version)
+    upload(args.dataset, args.version or args.dataset)
