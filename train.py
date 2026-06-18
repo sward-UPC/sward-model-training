@@ -47,14 +47,14 @@ print(f"Dispositivo: {DEVICE}")
 DATASET = os.environ.get("KT_DATASET", "assist2015")
 DATA_DIR = Path(os.environ.get("KT_DATA_DIR", f"data/{DATASET}"))
 SEQ_LEN = 200
-EMB_SIZE = 256
-NUM_HEADS = 8
+EMB_SIZE = int(os.environ.get("KT_EMB_SIZE", "256"))
+NUM_HEADS = int(os.environ.get("KT_HEADS", "8"))
 DROPOUT = 0.2
-NUM_ENCODER_LAYERS = 2
-BATCH_SIZE = 64
-EPOCHS = 200
+NUM_ENCODER_LAYERS = int(os.environ.get("KT_LAYERS", "2"))
+BATCH_SIZE = int(os.environ.get("KT_BATCH", "64"))
+EPOCHS = int(os.environ.get("KT_EPOCHS", "200"))
 LR = 1e-3
-PATIENCE = 20
+PATIENCE = int(os.environ.get("KT_PATIENCE", "20"))
 N_FOLDS = 5          # fold 0..4 → usamos fold 4 como validación
 
 OUTPUT_DIR = Path("outputs")
@@ -365,7 +365,7 @@ def main():
     r_ex = torch.zeros(1, SEQ_LEN, dtype=torch.long)
     qry_ex = torch.zeros(1, SEQ_LEN, dtype=torch.long)
     traced = torch.jit.trace(model_cpu, (q_ex, r_ex, qry_ex))
-    traced_path = OUTPUT_DIR / "sakt_assist2015_traced.pt"
+    traced_path = OUTPUT_DIR / f"sakt_{DATASET}_traced.pt"
     torch.jit.save(traced, traced_path)
     print(f"Modelo TorchScript guardado: {traced_path}")
 
