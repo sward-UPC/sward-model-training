@@ -49,9 +49,9 @@ NUM_HEADS = 8
 DROPOUT = 0.2
 NUM_ENCODER_LAYERS = 2
 BATCH_SIZE = 64
-EPOCHS = 30
+EPOCHS = 200
 LR = 1e-3
-PATIENCE = 5
+PATIENCE = 20
 N_FOLDS = 5          # fold 0..4 → usamos fold 4 como validación
 
 OUTPUT_DIR = Path("outputs")
@@ -61,6 +61,19 @@ PAD = -1
 
 
 # ── Metadatos del dataset ─────────────────────────────────────────────────────
+def build_concept_index(conceptos: list[str]) -> dict[str, int]:
+    """Mapa concepto(str)→índice entero estable (orden de aparición).
+
+    Lo consume ms-recomendacion para traducir el concepto (sección Moodle) al
+    índice que entiende el modelo. Para ASSISTments es prácticamente identidad.
+    """
+    index: dict[str, int] = {}
+    for c in conceptos:
+        if c not in index:
+            index[c] = len(index)
+    return index
+
+
 def get_n_skills() -> int:
     import pandas as pd
 
@@ -136,15 +149,38 @@ def get_loaders(n_skills: int):
     return train_loader, valid_loader, test_loader
 
 
-# ── Modelo SAKT (pyKT) ────────────────────────────────────────────────────────
+# ── Modelo SAKT (pyKT) con key_padding_mask ──────────────────────────────────
 def build_model(n_skills: int):
-    from pykt.models.sakt import SAKT
+    from pykt.models.sakt import SAKT, Blocks
+    from pykt.models.utils import ut_mask
     import pykt.models.utils as _pykt_utils
 
-    # pyKT calcula device como "cpu"/"cuda" sin saber de MPS.
-    # Parcheamos la variable de módulo para que pos_encode y ut_mask
-    # generen tensores en el mismo device que el modelo.
     _pykt_utils.device = str(DEVICE)
+
+    # Monkey-patch: añade key_padding_mask al bloque de atención de pyKT.
+    # El checkpoint resultante es idéntico — solo cambia el forward de entrenamiento.
+    def _blocks_forward(self, q=None, k=None, v=None, key_padding_mask=None):
+        q, k, v = q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2)
+        causal_mask = ut_mask(seq_len=k.shape[0])
+        attn_emb, _ = self.attn(q, k, v, attn_mask=causal_mask, key_padding_mask=key_padding_mask)
+        attn_emb = self.attn_dropout(attn_emb)
+        attn_emb, q = attn_emb.permute(1, 0, 2), q.permute(1, 0, 2)
+        attn_emb = self.attn_layer_norm(q + attn_emb)
+        emb = self.FFN(attn_emb)
+        emb = self.FFN_dropout(emb)
+        emb = self.FFN_layer_norm(attn_emb + emb)
+        return emb
+
+    def _sakt_forward(self, q, r, qry, qtest=False, key_padding_mask=None):
+        qshftemb, xemb = self.base_emb(q, r, qry)
+        for i in range(self.num_en):
+            xemb = self.blocks[i](qshftemb, xemb, xemb, key_padding_mask=key_padding_mask)
+        p = torch.sigmoid(self.pred(self.dropout_layer(xemb))).squeeze(-1)
+        return p if not qtest else (p, xemb)
+
+    import types
+    Blocks.forward = _blocks_forward
+    SAKT.forward = _sakt_forward
 
     model = SAKT(
         num_c=n_skills,
@@ -160,13 +196,15 @@ def build_model(n_skills: int):
 
 # ── Extracción de batch (formato pyKT KTDataset) ──────────────────────────────
 def extract_batch(dcur):
-    # KTDataset devuelve dict con claves: cseqs, rseqs, shft_cseqs, shft_rseqs, masks, smasks
-    q = dcur["cseqs"].long().to(DEVICE)          # conceptos pasados
-    r = dcur["rseqs"].long().to(DEVICE)          # respuestas pasadas (float en pyKT, pero usamos long)
-    qry = dcur["shft_cseqs"].long().to(DEVICE)   # concepto siguiente (query)
+    q = dcur["cseqs"].long().to(DEVICE)
+    r = dcur["rseqs"].long().to(DEVICE)
+    qry = dcur["shft_cseqs"].long().to(DEVICE)
     target = dcur["shft_rseqs"].float().to(DEVICE)
     mask = dcur["smasks"].bool().to(DEVICE)
-    return q, r, qry, target, mask
+    # key_padding_mask: True en posiciones PAD → la atención las ignora.
+    # dcur["masks"] es True donde la posición es válida, así que invertimos.
+    key_padding_mask = (~dcur["masks"]).to(DEVICE)
+    return q, r, qry, target, mask, key_padding_mask
 
 
 # ── Epoch de entrenamiento ────────────────────────────────────────────────────
@@ -177,11 +215,10 @@ def train_epoch(model, loader, optimizer, criterion, epoch: int):
 
     bar = tqdm(loader, desc=f"  Epoch {epoch:02d} [train]", unit="batch", dynamic_ncols=True)
     for step, dcur in enumerate(bar, 1):
-        q, r, qry, target, mask = extract_batch(dcur)
+        q, r, qry, target, mask, key_padding_mask = extract_batch(dcur)
 
         optimizer.zero_grad()
-        # pyKT SAKT.forward devuelve solo p (ya con sigmoid); qtest=False
-        y = model(q, r, qry)
+        y = model(q, r, qry, key_padding_mask=key_padding_mask)
 
         active_y = y[mask]
         active_t = target[mask]
@@ -211,9 +248,9 @@ def eval_epoch(model, loader, criterion, desc="[eval]"):
     total_loss, all_preds, all_targets = 0.0, [], []
 
     for dcur in tqdm(loader, desc=f"  {desc}", unit="batch", dynamic_ncols=True, leave=False):
-        q, r, qry, target, mask = extract_batch(dcur)
+        q, r, qry, target, mask, key_padding_mask = extract_batch(dcur)
 
-        y = model(q, r, qry)
+        y = model(q, r, qry, key_padding_mask=key_padding_mask)
         active_y = y[mask]
         active_t = target[mask]
 
@@ -236,6 +273,12 @@ def main():
     n_skills = get_n_skills()
     print(f"Skills únicos: {n_skills}")
 
+    # Índice concepto→entero embebido en el checkpoint (contrato con ms-recomendacion).
+    # En ASSISTments los conceptos ya son enteros 0..n-1 → índice identidad.
+    # Para un dataset Moodle (conceptos = secciones, strings) se construiría aquí
+    # mapeando cada etiqueta única a un entero (ver build_concept_index).
+    concept_index = build_concept_index([str(i) for i in range(n_skills)])
+
     train_loader, valid_loader, test_loader = get_loaders(n_skills)
     print(f"Batches — train: {len(train_loader)}, val: {len(valid_loader)}, test: {len(test_loader)}\n")
 
@@ -243,9 +286,11 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Parámetros del modelo: {total_params:,}\n")
 
-    optimizer = Adam(model.parameters(), lr=LR, weight_decay=1e-5)
+    optimizer = Adam(model.parameters(), lr=LR, weight_decay=1e-4)
     criterion = nn.BCELoss()  # pyKT SAKT ya aplica sigmoid
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=2, factor=0.5)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", patience=5, factor=0.5, min_lr=1e-6
+    )
 
     best_val_auc = 0.0
     patience_counter = 0
@@ -255,7 +300,7 @@ def main():
     for epoch in range(1, EPOCHS + 1):
         train_loss, train_auc, t_elapsed = train_epoch(model, train_loader, optimizer, criterion, epoch)
         val_loss, val_auc = eval_epoch(model, valid_loader, criterion, desc="[val]  ")
-        scheduler.step(val_loss)
+        scheduler.step(val_auc)
 
         avg_time = (time.time() - train_start) / epoch
         eta_sec = avg_time * (EPOCHS - epoch)
@@ -281,6 +326,7 @@ def main():
                     "n_heads": NUM_HEADS,
                     "dropout": DROPOUT,
                     "n_layers": NUM_ENCODER_LAYERS,
+                    "concept_index": concept_index,
                     "val_auc": round(val_auc, 4),
                     "epoch": epoch,
                 },
@@ -302,6 +348,20 @@ def main():
     print(f"\n=== Resultado final ===")
     print(f"Test AUC: {test_auc:.4f}  (esperado: ~0.74-0.76)")
     print(f"Modelo guardado: {best_model_path}")
+
+    # Export TorchScript: ms-recomendacion lo carga sin necesitar pyKT.
+    # Resetear device global de pyKT a cpu antes de trazar (pos_encode lo usa).
+    import pykt.models.utils as _pykt_utils_inf
+    _pykt_utils_inf.device = "cpu"
+    model_cpu = model.cpu().eval()
+    q_ex = torch.zeros(1, SEQ_LEN, dtype=torch.long)
+    r_ex = torch.zeros(1, SEQ_LEN, dtype=torch.long)
+    qry_ex = torch.zeros(1, SEQ_LEN, dtype=torch.long)
+    traced = torch.jit.trace(model_cpu, (q_ex, r_ex, qry_ex))
+    traced_path = OUTPUT_DIR / "sakt_assist2015_traced.pt"
+    torch.jit.save(traced, traced_path)
+    print(f"Modelo TorchScript guardado: {traced_path}")
+
     print(f"\nSiguiente paso: python upload_s3.py")
 
     meta = {
