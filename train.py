@@ -10,6 +10,7 @@ Siguiente paso: python upload_s3.py
 """
 
 # pyKT bug 1: qdkt.py importa turtle (requiere Tk). Mock antes de que pyKT cargue.
+import os
 import sys
 import types as _types
 
@@ -41,8 +42,10 @@ else:
 print(f"Dispositivo: {DEVICE}")
 
 # ── Hiperparámetros ───────────────────────────────────────────────────────────
-DATASET = "assist2015"
-DATA_DIR = Path("data/assist2015")
+# Dataset configurable por env: assist2015 (default) o moodle (data real exportada
+# por export_moodle_to_pykt.py). Permite re-entrenar SAKT sobre conceptos de Moodle.
+DATASET = os.environ.get("KT_DATASET", "assist2015")
+DATA_DIR = Path(os.environ.get("KT_DATA_DIR", f"data/{DATASET}"))
 SEQ_LEN = 200
 EMB_SIZE = 256
 NUM_HEADS = 8
@@ -274,10 +277,14 @@ def main():
     print(f"Skills únicos: {n_skills}")
 
     # Índice concepto→entero embebido en el checkpoint (contrato con ms-recomendacion).
-    # En ASSISTments los conceptos ya son enteros 0..n-1 → índice identidad.
-    # Para un dataset Moodle (conceptos = secciones, strings) se construiría aquí
-    # mapeando cada etiqueta única a un entero (ver build_concept_index).
-    concept_index = build_concept_index([str(i) for i in range(n_skills)])
+    # Si el dataset trae concept_index.json (Moodle: secciones→entero) se usa ese;
+    # en ASSISTments los conceptos ya son enteros 0..n-1 → índice identidad.
+    ci_path = DATA_DIR / "concept_index.json"
+    if ci_path.exists():
+        concept_index = json.loads(ci_path.read_text())
+        print(f"concept_index cargado de {ci_path} ({len(concept_index)} conceptos)")
+    else:
+        concept_index = build_concept_index([str(i) for i in range(n_skills)])
 
     train_loader, valid_loader, test_loader = get_loaders(n_skills)
     print(f"Batches — train: {len(train_loader)}, val: {len(valid_loader)}, test: {len(test_loader)}\n")
@@ -294,7 +301,7 @@ def main():
 
     best_val_auc = 0.0
     patience_counter = 0
-    best_model_path = OUTPUT_DIR / "sakt_assist2015.pth"
+    best_model_path = OUTPUT_DIR / f"sakt_{DATASET}.pth"
     train_start = time.time()
 
     for epoch in range(1, EPOCHS + 1):
