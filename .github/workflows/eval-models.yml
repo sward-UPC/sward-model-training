@@ -37,6 +37,18 @@ jobs:
           pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
           pip install --quiet pykt-toolkit scikit-learn numpy pandas
 
+      - name: Descargar dataset fresco (si hay secrets)
+        env:
+          SWARD_API_URL: ${{ secrets.SWARD_API_URL }}
+          TRAZABILIDAD_SERVICE_KEY: ${{ secrets.TRAZABILIDAD_SERVICE_KEY }}
+        run: |
+          if [ -n "$SWARD_API_URL" ] && [ -n "$TRAZABILIDAD_SERVICE_KEY" ]; then
+            echo "Refrescando dataset desde el training-data real de SWARD…"
+            python evaluation/fetch_dataset.py || echo "::warning::no se pudo refrescar; uso el dataset commiteado"
+          else
+            echo "Sin secrets SWARD_API_URL/TRAZABILIDAD_SERVICE_KEY → uso el dataset commiteado (snapshot)."
+          fi
+
       - name: Ejecutar comparación de modelos
         env:
           DATASET: outputs/moodle_kt_dataset.json
