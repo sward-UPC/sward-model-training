@@ -1,0 +1,56 @@
+name: Evaluar modelos KT
+
+# Evaluación reproducible de modelos de Knowledge Tracing para la tesis.
+# Entrena SAKT y DKT (pyKT) + baselines con validación cruzada K-fold sobre el
+# dataset real de Moodle (outputs/moodle_kt_dataset.json), calcula AUC/ACC/F1/RMSE
+# y sube la tabla comparativa (CSV + Markdown) como artifact.
+#
+# Solo a demanda: es un experimento de tesis, no parte del pipeline de despliegue.
+on:
+  workflow_dispatch:
+    inputs:
+      kfolds:
+        description: "Número de folds de la validación cruzada"
+        default: "5"
+        required: false
+      epochs:
+        description: "Épocas de entrenamiento de los modelos neuronales"
+        default: "60"
+        required: false
+      models:
+        description: "Modelos a comparar (separados por comas)"
+        default: "sakt,dkt,baseline_global,baseline_concept"
+        required: false
+
+jobs:
+  evaluar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependencias (torch CPU + pykt + sklearn)
+        run: |
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet pykt-toolkit scikit-learn numpy pandas
+
+      - name: Ejecutar comparación de modelos
+        env:
+          DATASET: outputs/moodle_kt_dataset.json
+          KFOLDS: ${{ github.event.inputs.kfolds }}
+          EPOCHS: ${{ github.event.inputs.epochs }}
+          MODELS: ${{ github.event.inputs.models }}
+          SEED: "42"
+        run: python evaluation/compare_models.py
+
+      - name: Subir tabla comparativa como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-comparison
+          path: |
+            outputs/model_comparison.csv
+            outputs/model_comparison.md
+          if-no-files-found: error
