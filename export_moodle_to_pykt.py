@@ -23,6 +23,12 @@ MOODLE_TOKEN = os.environ["MOODLE_TOKEN"]
 COURSE_IDS = [int(c) for c in os.environ.get("COURSE_IDS", "2,3,4,5").split(",")]
 ENDPOINT = f"{MOODLE_URL}/webservice/rest/server.php"
 OUT = Path(__file__).parent / "outputs" / "moodle_kt_dataset.json"
+# Si es 1, cada estudiante produce UNA secuencia que atraviesa todos sus
+# cursos, en vez de una por cada par estudiante-curso. Con secciones de
+# ~8 actividades, separar por curso deja secuencias demasiado cortas para
+# que la auto-atencion tenga algo que seleccionar.
+CONCAT_POR_ESTUDIANTE = os.environ.get("CONCAT_POR_ESTUDIANTE", "0") == "1"
+
 APROBADO = 0.5  # graderaw/grademax >= 0.5 => acierto (igual que get_events)
 
 
@@ -97,8 +103,10 @@ def _escribir_csv_pykt(sequences: list[dict], concept_index: dict[str, int]) -> 
 def main() -> None:
     concept_index: dict[str, int] = {}
     sequences: list[dict] = []
+    # Acumulador para el modo concatenado: student_id -> lista de interacciones.
+    por_estudiante: dict[int, list[tuple[int, int, str, int]]] = {}
 
-    for cid in COURSE_IDS:
+    for orden_curso, cid in enumerate(COURSE_IDS):
         secciones, orden = _seccion_por_instancia(cid)
         rank = {nombre: i for i, nombre in enumerate(orden)}
         users = _call("core_enrol_get_enrolled_users", courseid=cid)
@@ -126,11 +134,33 @@ def main() -> None:
             for _, concepto, _ in inter:
                 if concepto not in concept_index:
                     concept_index[concepto] = len(concept_index)
+
+            if CONCAT_POR_ESTUDIANTE:
+                por_estudiante.setdefault(u["id"], []).extend(
+                    (orden_curso, r, c, a) for r, c, a in inter
+                )
+            else:
+                sequences.append({
+                    "student": u["id"],
+                    "course": cid,
+                    "concepts": [concept_index[c] for _, c, _ in inter],
+                    "responses": [a for _, _, a in inter],
+                })
+
+    if CONCAT_POR_ESTUDIANTE:
+        # Una sola trayectoria por estudiante: el conocimiento de una persona es
+        # una secuencia, no una por curso. Sin marcas de tiempo fiables en el
+        # gradebook, se ordena por (curso, seccion), que es determinista y
+        # reproducible; con timestamps reales convendria ordenar por fecha.
+        for sid, items in sorted(por_estudiante.items()):
+            items.sort(key=lambda x: (x[0], x[1]))
+            if len(items) < 2:
+                continue
             sequences.append({
-                "student": u["id"],
-                "course": cid,
-                "concepts": [concept_index[c] for _, c, _ in inter],
-                "responses": [a for _, _, a in inter],
+                "student": sid,
+                "course": "todos",
+                "concepts": [concept_index[c] for _, _, c, _ in items],
+                "responses": [a for _, _, _, a in items],
             })
 
     OUT.parent.mkdir(parents=True, exist_ok=True)
@@ -141,8 +171,13 @@ def main() -> None:
     _escribir_csv_pykt(sequences, concept_index)
     total = sum(len(s["responses"]) for s in sequences)
     correctas = sum(sum(s["responses"]) for s in sequences)
+    largos = [len(s["responses"]) for s in sequences]
+    modo = "concatenado por estudiante" if CONCAT_POR_ESTUDIANTE else "una por estudiante-curso"
+    print(f"Modo: {modo}")
     print(f"Secuencias: {len(sequences)} | interacciones: {total} | "
           f"conceptos: {len(concept_index)} | %correctas: {100 * correctas / total:.0f}%")
+    print(f"Largo de secuencia — min: {min(largos)} | mediana: "
+          f"{sorted(largos)[len(largos) // 2]} | max: {max(largos)}")
     print(f"Guardado en {OUT}")
 
 
