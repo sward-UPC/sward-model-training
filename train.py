@@ -32,6 +32,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # ── Device ────────────────────────────────────────────────────────────────────
+# Hilos de CPU para torch. Por defecto usa todos los nucleos, lo que en
+# laptops con disipacion limitada dispara el thermal throttling y puede
+# rendir MENOS que dejar margen. KT_THREADS permite acotarlo.
+_hilos = os.environ.get("KT_THREADS")
+if _hilos:
+    torch.set_num_threads(int(_hilos))
+
 if torch.backends.mps.is_available():
     DEVICE = torch.device("mps")
 elif torch.cuda.is_available():
@@ -46,7 +53,14 @@ print(f"Dispositivo: {DEVICE}")
 # por export_moodle_to_pykt.py). Permite re-entrenar SAKT sobre conceptos de Moodle.
 DATASET = os.environ.get("KT_DATASET", "assist2015")
 DATA_DIR = Path(os.environ.get("KT_DATA_DIR", f"data/{DATASET}"))
-SEQ_LEN = 200
+# Ventana de secuencia. Los CSV vienen en filas de 200 posiciones, pero la
+# mediana de interacciones reales por fila es 23 y el p90 es 90: con 200 se
+# procesa ~81% de relleno, y como la auto-atencion es O(L^2) ese desperdicio
+# domina el costo. El relleno esta al final de cada fila, asi que truncar es
+# seguro. Con 100 queda intacto el 91% de las filas y la atencion cuesta 4x
+# menos. Se deja 200 por defecto para no cambiar el comportamiento en
+# silencio; el valor usado queda registrado en el checkpoint.
+SEQ_LEN = int(os.environ.get("KT_SEQ_LEN", "200"))
 EMB_SIZE = int(os.environ.get("KT_EMB_SIZE", "256"))
 NUM_HEADS = int(os.environ.get("KT_HEADS", "8"))
 DROPOUT = 0.2
@@ -106,9 +120,16 @@ class KTDatasetCPU(torch.utils.data.Dataset):
 
         self.cseqs, self.rseqs, self.smasks = [], [], []
         for _, row in df.iterrows():
-            c = [int(x) for x in str(row["concepts"]).split(",")]
-            r = [int(x) for x in str(row["responses"]).split(",")]
-            s = [int(x) for x in str(row["selectmasks"]).split(",")]
+            c = [int(x) for x in str(row["concepts"]).split(",")][:SEQ_LEN]
+            r = [int(x) for x in str(row["responses"]).split(",")][:SEQ_LEN]
+            s = [int(x) for x in str(row["selectmasks"]).split(",")][:SEQ_LEN]
+            # Si la ventana pedida excede la del CSV, se rellena para mantener
+            # todas las filas del mismo largo.
+            falta = SEQ_LEN - len(c)
+            if falta > 0:
+                c += [-1] * falta
+                r += [-1] * falta
+                s += [-1] * falta
             self.cseqs.append(c)
             self.rseqs.append(r)
             self.smasks.append(s)
