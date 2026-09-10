@@ -403,8 +403,16 @@ def main():
         "test_auc": round(test_auc, 4),
         "best_val_auc": round(best_val_auc, 4),
     }
-    with open(OUTPUT_DIR / "model_meta.json", "w") as f:
+    # Con sufijo de dataset, igual que el checkpoint y la version trazada. Sin
+    # el, entrenar moodle despues de assist2015 (o al reves) pisaba los
+    # metadatos del anterior, y upload_s3.py terminaba subiendo a S3 el modelo
+    # de un dataset junto a los metadatos de otro. ms-recomendacion lee ese
+    # archivo para mostrar hiperparametros y AUC en el panel de administracion,
+    # asi que el panel reportaba cifras que no correspondian al modelo servido.
+    meta_path = OUTPUT_DIR / f"model_meta_{DATASET}.json"
+    with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
+    print(f"Metadatos guardados: {meta_path}")
 
 
 if __name__ == "__main__":
