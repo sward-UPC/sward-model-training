@@ -276,6 +276,58 @@ class ResultadoSecuencia:
     suff_rand: float
 
 
+def prueba_significancia(comp_attn: list, comp_rand: list) -> dict:
+    """Wilcoxon pareado entre comprehensiveness de atención y del azar.
+
+    Cada secuencia aporta un par (atención, azar) medido sobre la MISMA
+    secuencia, así que la prueba pareada es la que corresponde. Se usa Wilcoxon
+    de rangos con signo y no una t de Student porque las diferencias de
+    comprehensiveness no son normales: se concentran cerca de cero con colas
+    largas.
+
+    Hipótesis alternativa unilateral: la atención es MAYOR que el azar. Es la
+    dirección que interesa; una atención peor que el azar no sería un hallazgo
+    a favor de la explicabilidad.
+
+    Devuelve además el tamaño del efecto (correlación biserial por rangos),
+    porque con n grande un p pequeño puede acompañar a un efecto trivial.
+    """
+    try:
+        from scipy.stats import wilcoxon
+    except ImportError:
+        return {"error": "scipy no disponible"}
+
+    pares = [(a, r) for a, r in zip(comp_attn, comp_rand)]
+    difs = [a - r for a, r in pares]
+    no_nulas = [d for d in difs if d != 0]
+
+    if len(no_nulas) < 6:
+        return {"error": f"muy pocas diferencias no nulas (n={len(no_nulas)})"}
+
+    try:
+        stat, p = wilcoxon(
+            [a for a, _ in pares],
+            [r for _, r in pares],
+            alternative="greater",
+            zero_method="wilcox",
+        )
+    except ValueError as e:
+        return {"error": str(e)}
+
+    n = len(no_nulas)
+    total_rangos = n * (n + 1) / 2
+    # r = 2 * W+ / (n(n+1)) - 1, en [-1, 1].
+    efecto = (2 * stat / total_rangos) - 1 if total_rangos else 0.0
+
+    return {
+        "W": float(stat),
+        "p": float(p),
+        "n": n,
+        "efecto": float(efecto),
+        "significativo": bool(p < 0.05),
+    }
+
+
 @dataclass
 class Agregado:
     """Promedios sobre todas las secuencias evaluadas, por k."""
@@ -396,6 +448,34 @@ def construir_reporte(agregados: list, n_seqs: int, checkpoint: str, dataset: st
             f"{cr:+.4f} | **{delta:+.4f}** | {sa:+.4f} | {sr:+.4f} | {pct:.1f}% |"
         )
     lineas.append("")
+
+    lineas.append("## Significancia estadística\n")
+    lineas.append(
+        "Prueba de Wilcoxon de rangos con signo, pareada por secuencia, con "
+        "hipótesis alternativa unilateral (atención > azar). Cada secuencia "
+        "aporta un par medido sobre sí misma, por eso la prueba es pareada. "
+        "Se prefiere Wilcoxon a la t de Student porque las diferencias no son "
+        "normales.\n"
+    )
+    lineas.append("| k | n pares | W | p | Tamaño del efecto (r) | ¿p < 0.05? |")
+    lineas.append("|---|---|---|---|---|---|")
+    for a in agregados:
+        pr = prueba_significancia(a.comp_attn, a.comp_rand)
+        if "error" in pr:
+            lineas.append(f"| {a.k} | — | — | — | — | {pr['error']} |")
+            continue
+        marca = "**sí**" if pr["significativo"] else "no"
+        lineas.append(
+            f"| {a.k} | {pr['n']} | {pr['W']:.1f} | {pr['p']:.4f} | "
+            f"{pr['efecto']:+.3f} | {marca} |"
+        )
+    lineas.append("")
+    lineas.append(
+        "> El tamaño del efecto es la correlación biserial por rangos, en el "
+        "rango [-1, 1]. Se reporta junto al valor p porque un p pequeño con un "
+        "efecto trivial no sustenta una afirmación de explicabilidad: dice que "
+        "la diferencia existe, no que importe.\n"
+    )
 
     lineas.append("## Cómo leer cada métrica\n")
     lineas.append(
@@ -576,6 +656,16 @@ def main(argv=None):
             f"(Δ={ca - cr:+.4f}) | sufficiency atención={sa:+.4f} vs azar={sr:+.4f} "
             f"| gana al azar={pct:.1f}%"
         )
+
+    print("\n=== SIGNIFICANCIA (Wilcoxon pareado, atención > azar) ===")
+    for a in ordenados:
+        pr = prueba_significancia(a.comp_attn, a.comp_rand)
+        if "error" in pr:
+            print(f"  k={a.k}: {pr['error']}")
+        else:
+            marca = "SIGNIFICATIVO" if pr["significativo"] else "no significativo"
+            print(f"  k={a.k} (n={pr['n']}): W={pr['W']:.1f} p={pr['p']:.4f} "
+                  f"efecto r={pr['efecto']:+.3f} -> {marca}")
 
     # --- Markdown ---
     reporte = construir_reporte(ordenados, n_evaluadas, args.checkpoint, args.dataset)
