@@ -51,5 +51,26 @@ test_loss, test_auc = T.eval_epoch(modelo, test_loader, criterio, "[test]")
 print(f"Validación : loss={val_loss:.4f}  AUC={val_auc:.4f}")
 print(f"Prueba     : loss={test_loss:.4f}  AUC={test_auc:.4f}")
 print()
+# Si la corrida se interrumpió, train.py nunca escribió los metadatos. Se
+# generan aquí, con el mismo formato y el sufijo de dataset.
+import json  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+ds = os.environ["KT_DATASET"]
+meta = {
+    "dataset": ds,
+    "n_skills": ck["n_skills"],
+    "seq_len": ck["seq_len"],
+    "emb_size": ck["emb_size"],
+    "n_heads": ck["n_heads"],
+    "dropout": ck.get("dropout"),
+    "n_layers": ck["n_layers"],
+    "test_auc": round(test_auc, 4),
+    "best_val_auc": round(val_auc, 4),
+}
+destino = Path(RUTA).parent / f"model_meta_{ds}.json"
+destino.write_text(json.dumps(meta, indent=2))
+print(f"Metadatos escritos: {destino}")
+print()
 print("Referencia: pyKT reporta ~0.72 para SAKT sobre ASSISTments 2015.")
 print("La diferencia se atribuye a que no se realizó búsqueda de hiperparámetros.")
