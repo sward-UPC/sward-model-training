@@ -21,6 +21,17 @@ Reusa el patrón de carga del checkpoint y el monkeypatch `_last_attn` de
 `sward-ms-recomendacion/src/domain/services/modelo_sakt.py` (copiado/adaptado a
 propósito: este script es autónomo y NO importa el microservicio).
 
+Formato de entrada (corrección del 12-09-2026):
+    La versión anterior preparaba SIEMPRE la entrada como el adaptador de
+    producción: relleno por la izquierda y sin máscara. Pero los checkpoints que
+    evalúa este script salen de train.py, que entrena con relleno por la derecha
+    y key_padding_mask. Evaluados así, el 85% de la atención caía sobre el relleno
+    y las diferencias de comprehensiveness eran del orden de 0.001: los
+    resultados de fidelidad obtenidos antes de esta corrección no son válidos.
+    Ahora el formato se lee del checkpoint (clave `formato_entrada`, o su huella
+    de claves en checkpoints anteriores) y puede forzarse con --formato-entrada
+    para reproducir la medición antigua.
+
 Uso:
     python evaluation/xai_faithfulness.py \
         --checkpoint outputs/sakt_moodle.pth \
@@ -42,10 +53,32 @@ import sys
 import types as _types
 from dataclasses import dataclass, field
 
-# Token de "borrado" para perturbar una interacción. 0 es el valor de padding que
-# el modelo ya ve durante el entrenamiento (ver train_sakt.py), por lo que es el
-# sustituto neutro natural: equivale a "esta interacción no ocurrió".
+# Token de relleno y de "borrado". Con relleno por la derecha, además de poner el
+# contenido en PAD, la posición borrada se enmascara en la atención: así "borrar"
+# significa de verdad "esta interacción no ocurrió".
 PAD_TOKEN = 0
+
+FORMATO_IZQUIERDA = "relleno_izquierda"  # training/train_sakt.py (producción)
+FORMATO_DERECHA = "relleno_derecha"  # train.py (este repositorio)
+FORMATOS_VALIDOS = (FORMATO_IZQUIERDA, FORMATO_DERECHA)
+
+
+def detectar_formato_entrada(checkpoint: dict, forzado: str = "") -> str:
+    """Misma regla que sward-ms-recomendacion/.../sakt_pykt_adapter.py.
+
+    Se duplica a propósito: este script es autónomo y no importa el servicio.
+    Si cambia la regla allá, hay que cambiarla aquí.
+    """
+    if forzado:
+        if forzado not in FORMATOS_VALIDOS:
+            raise ValueError(f"formato inválido: {forzado!r}")
+        return forzado
+    declarado = checkpoint.get("formato_entrada")
+    if declarado in FORMATOS_VALIDOS:
+        return declarado
+    if "val_auc" in checkpoint and "trained_at" not in checkpoint:
+        return FORMATO_DERECHA
+    return FORMATO_IZQUIERDA
 
 
 # --------------------------------------------------------------------------- #
@@ -67,9 +100,10 @@ class ModeloCargado:
     seq_len: int
     n_skills: int
     concept_index: dict
+    formato: str = FORMATO_IZQUIERDA
 
 
-def cargar_sakt(checkpoint_path: str) -> ModeloCargado:
+def cargar_sakt(checkpoint_path: str, formato_forzado: str = "") -> ModeloCargado:
     """Carga el checkpoint pyKT-SAKT y parchea el bloque para capturar `_last_attn`.
 
     Idéntico en espíritu a ModeloSAKT._cargar_modelo, pero local: lee desde disco
@@ -87,6 +121,7 @@ def cargar_sakt(checkpoint_path: str) -> ModeloCargado:
     dropout = checkpoint["dropout"]
     n_layers = checkpoint["n_layers"]
     concept_index = checkpoint.get("concept_index", {}) or {}
+    formato = detectar_formato_entrada(checkpoint, formato_forzado)
 
     _mock_turtle()
 
@@ -97,12 +132,14 @@ def cargar_sakt(checkpoint_path: str) -> ModeloCargado:
     _pykt_utils.device = "cpu"
 
     # Monkeypatch del bloque de atención para CAPTURAR los pesos (el forward de
-    # pyKT los descarta). Idéntico al stock salvo que guarda _last_attn.
-    def _blocks_forward_capture(self, q=None, k=None, v=None):
+    # pyKT los descarta) y aceptar máscara de relleno, como en train.py. Con
+    # key_padding_mask=None es idéntico al stock.
+    def _blocks_forward_capture(self, q=None, k=None, v=None, key_padding_mask=None):
         q, k, v = q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2)
         causal_mask = ut_mask(seq_len=k.shape[0])
         attn_emb, attn_w = self.attn(
-            q, k, v, attn_mask=causal_mask, need_weights=True
+            q, k, v, attn_mask=causal_mask,
+            key_padding_mask=key_padding_mask, need_weights=True,
         )
         self._last_attn = attn_w.detach()  # (batch, tgt_len, src_len)
         attn_emb = self.attn_dropout(attn_emb)
@@ -113,7 +150,15 @@ def cargar_sakt(checkpoint_path: str) -> ModeloCargado:
         emb = self.FFN_layer_norm(attn_emb + emb)
         return emb
 
+    def _sakt_forward(self, q, r, qry, qtest=False, key_padding_mask=None):
+        qshftemb, xemb = self.base_emb(q, r, qry)
+        for i in range(self.num_en):
+            xemb = self.blocks[i](qshftemb, xemb, xemb, key_padding_mask=key_padding_mask)
+        p = torch.sigmoid(self.pred(self.dropout_layer(xemb))).squeeze(-1)
+        return p if not qtest else (p, xemb)
+
     Blocks.forward = _blocks_forward_capture
+    SAKT.forward = _sakt_forward
 
     model = SAKT(
         num_c=n_skills,
@@ -131,19 +176,53 @@ def cargar_sakt(checkpoint_path: str) -> ModeloCargado:
         seq_len=seq_len,
         n_skills=n_skills,
         concept_index=concept_index,
+        formato=formato,
     )
 
 
 # --------------------------------------------------------------------------- #
 # Inferencia + extracción de atención (adaptado de _real_prediccion)
 # --------------------------------------------------------------------------- #
+def _entrada(modelo: ModeloCargado, q: list, r: list, qry: list, borrados=()):
+    """Tensores en el formato con que se entrenó el checkpoint.
+
+    Devuelve (q, r, qry, key_padding_mask, posición del último paso real).
+    """
+    import torch  # lazy
+
+    n = len(qry)
+    relleno = [PAD_TOKEN] * (modelo.seq_len - n)
+    if modelo.formato == FORMATO_DERECHA:
+        kpm = torch.zeros(1, modelo.seq_len, dtype=torch.bool)
+        kpm[0, n:] = True
+        for j in borrados:
+            # La posición 0 no se enmascara: bajo máscara causal es la única clave
+            # de la consulta 0 y enmascararla produce NaN. Su contenido ya es PAD.
+            if j != 0:
+                kpm[0, j] = True
+        return (
+            torch.LongTensor([list(q) + relleno]),
+            torch.LongTensor([list(r) + relleno]),
+            torch.LongTensor([list(qry) + relleno]),
+            kpm,
+            n - 1,
+        )
+    return (
+        torch.LongTensor([relleno + list(q)]),
+        torch.LongTensor([relleno + list(r)]),
+        torch.LongTensor([relleno + list(qry)]),
+        None,
+        -1,
+    )
+
+
 def _predecir(modelo: ModeloCargado, concepts: list, responses: list):
     """Devuelve (prob_ultimo_paso, pesos_atencion_sobre_pasado).
 
-    Replica EXACTAMENTE el formato de inferencia de modelo_sakt._real_prediccion:
+    Formato KT:
         q   = concepts[:-1]   (interacciones pasadas)
         r   = responses[:-1]
-        qry = concepts[1:]    (consulta desplazada) → out[-1] = P(correcto último)
+        qry = concepts[1:]    (consulta desplazada) → salida del último paso real
     `pesos` tiene longitud L-1 y suma 1 (atención normalizada sobre el pasado).
     """
     import torch  # lazy
@@ -155,24 +234,22 @@ def _predecir(modelo: ModeloCargado, concepts: list, responses: list):
     if L < 2:
         raise ValueError("Se requieren >= 2 interacciones para evaluar faithfulness.")
 
-    q = concepts[:-1]
-    r = responses[:-1]
-    qry = concepts[1:]
-
-    pad = seq_len - (L - 1)
-    q_t = torch.LongTensor([[PAD_TOKEN] * pad + q])
-    r_t = torch.LongTensor([[PAD_TOKEN] * pad + r])
-    qry_t = torch.LongTensor([[PAD_TOKEN] * pad + qry])
+    q, r, qry = concepts[:-1], responses[:-1], concepts[1:]
+    n = L - 1
+    q_t, r_t, qry_t, kpm, pos = _entrada(modelo, q, r, qry)
 
     with torch.no_grad():
-        out = modelo.model(q_t, r_t, qry_t)  # SAKT aplica sigmoid internamente
-        prob = float(out[0, -1].item())
+        out = modelo.model(q_t, r_t, qry_t, key_padding_mask=kpm)
+        prob = float(out[0, pos].item())
 
-    # Pesos de atención REALES del último paso sobre las L-1 interacciones pasadas.
-    pesos = [1.0 / (L - 1)] * (L - 1)
+    # Atención REAL del último paso real sobre las n interacciones pasadas.
+    pesos = [1.0 / n] * n
     try:
         attn = modelo.model.blocks[-1]._last_attn  # (1, seq_len, seq_len)
-        fila = attn[0, -1, -(L - 1):].tolist()
+        if modelo.formato == FORMATO_DERECHA:
+            fila = attn[0, n - 1, :n].tolist()
+        else:
+            fila = attn[0, -1, -n:].tolist()
         total = sum(fila)
         if total > 0:
             pesos = [w / total for w in fila]
@@ -188,36 +265,31 @@ def _predecir_perturbado(
     responses: list,
     indices_a_borrar: set,
 ):
-    """Predice tras BORRAR (poner a PAD) las interacciones pasadas indicadas.
+    """Predice tras BORRAR las interacciones pasadas indicadas.
 
     `indices_a_borrar` indexa el VECTOR DE PASADO (0..L-2), alineado con `pesos`.
-    Borrar = neutralizar la interacción: concepto y respuesta pasan a PAD_TOKEN, lo
-    que el modelo interpreta como "posición vacía/padding".
+    Borrar = contenido a PAD_TOKEN y, con relleno por la derecha, posición
+    enmascarada en la atención.
     """
     import torch  # lazy
 
     seq_len = modelo.seq_len
     concepts = list(concepts[-seq_len:])
     responses = list(responses[-seq_len:])
-    L = len(concepts)
 
     q = list(concepts[:-1])
     r = list(responses[:-1])
     qry = concepts[1:]  # la consulta NO se altera (es lo que predecimos)
 
-    for i in indices_a_borrar:
-        if 0 <= i < len(q):
-            q[i] = PAD_TOKEN
-            r[i] = PAD_TOKEN
+    validos = {i for i in indices_a_borrar if 0 <= i < len(q)}
+    for i in validos:
+        q[i] = PAD_TOKEN
+        r[i] = PAD_TOKEN
 
-    pad = seq_len - (L - 1)
-    q_t = torch.LongTensor([[PAD_TOKEN] * pad + q])
-    r_t = torch.LongTensor([[PAD_TOKEN] * pad + r])
-    qry_t = torch.LongTensor([[PAD_TOKEN] * pad + qry])
-
+    q_t, r_t, qry_t, kpm, pos = _entrada(modelo, q, r, qry, validos)
     with torch.no_grad():
-        out = modelo.model(q_t, r_t, qry_t)
-        return float(out[0, -1].item())
+        out = modelo.model(q_t, r_t, qry_t, key_padding_mask=kpm)
+        return float(out[0, pos].item())
 
 
 def _predecir_conservando(
@@ -398,7 +470,7 @@ def evaluar_secuencia(
 # --------------------------------------------------------------------------- #
 def cargar_secuencias(dataset_path: str) -> list:
     """Carga las secuencias del dataset Moodle (formato {concepts, responses})."""
-    data = json.load(open(dataset_path))
+    data = json.load(open(dataset_path, encoding="utf-8"))
     seqs = data["sequences"] if isinstance(data, dict) else data
     out = []
     for s in seqs:
@@ -420,7 +492,9 @@ def _desv(xs: list) -> float:
     return statistics.pstdev(xs) if len(xs) > 1 else 0.0
 
 
-def construir_reporte(agregados: list, n_seqs: int, checkpoint: str, dataset: str) -> str:
+def construir_reporte(
+    agregados: list, n_seqs: int, checkpoint: str, dataset: str, formato: str = ""
+) -> str:
     """Genera el Markdown de resultados (tabla + interpretación de tesis)."""
     lineas = []
     lineas.append("# Fidelidad de las explicaciones por atención del SAKT (XAI)\n")
@@ -431,6 +505,7 @@ def construir_reporte(agregados: list, n_seqs: int, checkpoint: str, dataset: st
     )
     lineas.append(f"- Checkpoint evaluado: `{checkpoint}`")
     lineas.append(f"- Dataset: `{dataset}`")
+    lineas.append(f"- Formato de entrada: `{formato}`")
     lineas.append(f"- Secuencias válidas evaluadas: **{n_seqs}**\n")
 
     lineas.append("## Resultados agregados\n")
@@ -590,6 +665,14 @@ def parse_args(argv=None):
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--formato-entrada",
+        choices=FORMATOS_VALIDOS,
+        default="",
+        help="Fuerza el formato de entrada. Por defecto se lee del checkpoint. "
+        "Forzar relleno_izquierda sobre un checkpoint de train.py reproduce la "
+        "medición anterior a la corrección.",
+    )
+    p.add_argument(
         "--out",
         default=os.path.join(base, "outputs", "xai_faithfulness.md"),
         help="Ruta del reporte Markdown de salida.",
@@ -604,10 +687,10 @@ def main(argv=None):
     rng = random.Random(args.seed)
 
     print(f"[xai] Cargando SAKT desde {args.checkpoint} ...")
-    modelo = cargar_sakt(args.checkpoint)
+    modelo = cargar_sakt(args.checkpoint, args.formato_entrada)
     print(
         f"[xai] Modelo OK | n_skills={modelo.n_skills} seq_len={modelo.seq_len} "
-        f"conceptos={len(modelo.concept_index)}"
+        f"conceptos={len(modelo.concept_index)} formato_entrada={modelo.formato}"
     )
 
     seqs = cargar_secuencias(args.dataset)
@@ -668,9 +751,11 @@ def main(argv=None):
                   f"efecto r={pr['efecto']:+.3f} -> {marca}")
 
     # --- Markdown ---
-    reporte = construir_reporte(ordenados, n_evaluadas, args.checkpoint, args.dataset)
+    reporte = construir_reporte(
+        ordenados, n_evaluadas, args.checkpoint, args.dataset, modelo.formato
+    )
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w") as f:
+    with open(args.out, "w", encoding="utf-8") as f:
         f.write(reporte)
     print(f"\n[xai] Reporte escrito en {args.out}")
 
