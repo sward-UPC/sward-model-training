@@ -357,6 +357,12 @@ def main():
                     "concept_index": concept_index,
                     "val_auc": round(val_auc, 4),
                     "epoch": epoch,
+                    # Contrato de entrada con que se entrenó: relleno a la derecha y
+                    # key_padding_mask. sward-ms-recomendacion lo lee para servir el
+                    # modelo igual; servirlo con relleno a la izquierda pone las
+                    # interacciones en posiciones nunca vistas y la atención sobre
+                    # el relleno.
+                    "formato_entrada": "relleno_derecha",
                 },
                 best_model_path,
             )
