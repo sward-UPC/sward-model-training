@@ -19,6 +19,16 @@ OUTPUTS = Path("outputs")
 
 def upload(dataset: str, version: str) -> None:
     model_path = OUTPUTS / f"sakt_{dataset}.pth"
+    # Los metadatos tambien van por dataset. Se acepta el nombre antiguo sin
+    # sufijo solo por compatibilidad con salidas anteriores, avisando, porque
+    # ese archivo puede describir un modelo distinto al que se esta subiendo.
+    meta_path = OUTPUTS / f"model_meta_{dataset}.json"
+    if not meta_path.exists():
+        legado = OUTPUTS / "model_meta.json"
+        if legado.exists():
+            print(f"AVISO: no existe {meta_path.name}; se usa {legado.name}, "
+                  "que puede pertenecer a otro dataset. Verificalo antes de subir.")
+            meta_path = legado
     if not model_path.exists():
         print(f"No se encontró el modelo en {model_path}. Ejecuta train.py primero.")
         return
@@ -28,7 +38,7 @@ def upload(dataset: str, version: str) -> None:
     archivos = [
         (model_path, f"{prefix}/model.pth"),
         (OUTPUTS / f"sakt_{dataset}_traced.pt", f"{prefix}/model_traced.pt"),
-        (OUTPUTS / "model_meta.json", f"{prefix}/model_meta.json"),
+        (meta_path, f"{prefix}/model_meta.json"),
     ]
     for local, s3_key in archivos:
         if not local.exists():
