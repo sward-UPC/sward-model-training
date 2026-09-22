@@ -22,12 +22,28 @@ MOODLE_URL = os.environ["MOODLE_URL"].rstrip("/")
 MOODLE_TOKEN = os.environ["MOODLE_TOKEN"]
 COURSE_IDS = [int(c) for c in os.environ.get("COURSE_IDS", "2,3,4,5").split(",")]
 ENDPOINT = f"{MOODLE_URL}/webservice/rest/server.php"
-OUT = Path(__file__).parent / "outputs" / "moodle_kt_dataset.json"
+# Carpetas de salida: por defecto las del repositorio. El reentrenamiento
+# (sward-local/oe4/reentrenar.py) usa otras para no pisar la evidencia de la tesis.
+OUT = (
+    Path(os.environ.get("KT_SALIDA", Path(__file__).parent / "outputs"))
+    / "moodle_kt_dataset.json"
+)
 # Si es 1, cada estudiante produce UNA secuencia que atraviesa todos sus
 # cursos, en vez de una por cada par estudiante-curso. Con secciones de
 # ~8 actividades, separar por curso deja secuencias demasiado cortas para
 # que la auto-atencion tenga algo que seleccionar.
 CONCAT_POR_ESTUDIANTE = os.environ.get("CONCAT_POR_ESTUDIANTE", "0") == "1"
+# Si es 1, las interacciones de cada secuencia se ordenan por la fecha de la
+# nota (gradedatesubmitted o, en su defecto, gradedategraded), que es el orden
+# en que el sistema en linea se las da al modelo. Solo si todas tienen fecha;
+# si falta alguna, se cae al orden por seccion. Por defecto no, para que los
+# datasets de la tesis (ordenados por seccion) se sigan reproduciendo igual.
+ORDEN_POR_FECHA = os.environ.get("ORDEN_POR_FECHA", "0") == "1"
+# Si es 1, el 20 % de prueba se toma de cada curso por separado. Con el split
+# global, el test salia casi entero del primer curso de COURSE_IDS: un curso
+# nuevo puesto primero quedaba fuera del entrenamiento, y puesto al final,
+# fuera de la evaluacion.
+SPLIT_POR_CURSO = os.environ.get("SPLIT_POR_CURSO", "0") == "1"
 
 APROBADO = 0.5  # graderaw/grademax >= 0.5 => acierto (igual que get_events)
 
@@ -55,7 +71,7 @@ def _seccion_por_instancia(course_id: int) -> tuple[dict[tuple[str, int], str], 
 
 SEQ_LEN = 200
 PAD = -1
-DATA_MOODLE = Path(__file__).parent / "data" / "moodle"
+DATA_MOODLE = Path(os.environ.get("KT_DATOS", Path(__file__).parent / "data")) / "moodle"
 
 
 def _fila_csv(concepts: list[int], responses: list[int], fold: int) -> dict:
@@ -81,8 +97,16 @@ def _escribir_csv_pykt(sequences: list[dict], concept_index: dict[str, int]) -> 
     import csv
 
     DATA_MOODLE.mkdir(parents=True, exist_ok=True)
-    n_test = max(1, len(sequences) // 5)
-    test, train_valid = sequences[:n_test], sequences[n_test:]
+    if SPLIT_POR_CURSO:
+        test, train_valid = [], []
+        for curso in dict.fromkeys(s["course"] for s in sequences):
+            del_curso = [s for s in sequences if s["course"] == curso]
+            n = max(1, len(del_curso) // 5)
+            test += del_curso[:n]
+            train_valid += del_curso[n:]
+    else:
+        n_test = max(1, len(sequences) // 5)
+        test, train_valid = sequences[:n_test], sequences[n_test:]
 
     def _dump(path: Path, seqs: list[dict], test_set: bool) -> None:
         with open(path, "w", newline="") as f:
@@ -117,6 +141,7 @@ def main() -> None:
         for u in estudiantes:
             d = _call("gradereport_user_get_grade_items", courseid=cid, userid=u["id"])
             inter = []  # (rank_seccion, concepto, acierto)
+            fechas = []  # fecha de cada nota, en el mismo orden que inter
             for ut in d.get("usergrades", []):
                 for it in ut.get("gradeitems", []):
                     mod = it.get("itemmodule")
@@ -128,7 +153,13 @@ def main() -> None:
                         continue
                     acierto = 1 if (gr / gm) >= APROBADO else 0
                     inter.append((rank.get(concepto, 999), concepto, acierto))
-            inter.sort(key=lambda x: x[0])  # orden temporal por sección
+                    fechas.append(it.get("gradedatesubmitted") or it.get("gradedategraded"))
+            if ORDEN_POR_FECHA and inter and all(fechas):
+                # Orden real en que se resolvieron, el mismo que ve el sistema.
+                orden_fecha = sorted(range(len(inter)), key=lambda i: (fechas[i], inter[i][0]))
+                inter = [inter[i] for i in orden_fecha]
+            else:
+                inter.sort(key=lambda x: x[0])  # orden temporal por sección
             if len(inter) < 2:
                 continue
             for _, concepto, _ in inter:
