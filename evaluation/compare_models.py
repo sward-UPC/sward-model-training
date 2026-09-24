@@ -52,6 +52,11 @@ import math
 import os
 from pathlib import Path
 
+try:  # como paquete (python -m evaluation.compare_models)
+    from . import tabular
+except ImportError:  # como script suelto (python evaluation/compare_models.py)
+    import tabular
+
 # ── Constante de padding (idéntica a export_moodle_to_pykt.py / train.py) ──────
 PAD = -1
 
@@ -85,11 +90,33 @@ def parse_config(argv: list[str] | None = None) -> dict:
         default=_env("MODELS", "sakt,dkt,baseline_global,baseline_concept"),
     )
     p.add_argument("--outdir", default=_env("OUTDIR", "outputs"))
+    p.add_argument("--outname", default=_env("OUTNAME", "model_comparison"))
     args = p.parse_args(argv)
 
     cfg = vars(args)
-    cfg["models"] = [m.strip() for m in cfg["models"].split(",") if m.strip()]
+    cfg["models"] = expandir_familias(
+        [m.strip() for m in cfg["models"].split(",") if m.strip()]
+    )
     return cfg
+
+
+# Atajos por familia, para no escribir diecinueve nombres en la línea de comandos.
+FAMILIAS = {
+    "kt": ["sakt", "dkt"],
+    "baselines": ["baseline_global", "baseline_concept"],
+    "tabular": list(tabular.MODELOS.keys()),
+}
+FAMILIAS["todos"] = FAMILIAS["kt"] + FAMILIAS["baselines"] + FAMILIAS["tabular"]
+
+
+def expandir_familias(nombres: list[str]) -> list[str]:
+    """Sustituye los atajos por sus modelos, sin repetir y conservando el orden."""
+    fuera: list[str] = []
+    for n in nombres:
+        for m in FAMILIAS.get(n, [n]):
+            if m not in fuera:
+                fuera.append(m)
+    return fuera
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -101,7 +128,7 @@ def cargar_dataset(path: str) -> tuple[list[dict], dict[str, int]]:
     Cada secuencia es {concepts: [int...], responses: [0/1...]} con al menos 2
     interacciones (necesario para tener un par (pasado, siguiente)).
     """
-    data = json.loads(Path(path).read_text())
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
     concept_index = data.get("concept_index", {})
     seqs = [
         {"concepts": list(map(int, s["concepts"])), "responses": list(map(int, s["responses"]))}
@@ -438,6 +465,8 @@ def evaluar_modelo(nombre: str, seqs: list[dict], n_skills: int, cfg: dict) -> d
             y_true, y_score = predecir_baseline_concept(train, test, n_skills)
         elif nombre in ("sakt", "dkt"):
             y_true, y_score = _entrenar_y_predecir_neuronal(nombre, train, test, n_skills, cfg)
+        elif nombre in tabular.MODELOS:
+            y_true, y_score = tabular.entrenar_y_predecir(nombre, train, test, n_skills, cfg)
         else:
             raise ValueError(f"Modelo desconocido: {nombre}")
 
@@ -470,6 +499,7 @@ NOMBRE_LARGO = {
     "baseline_global": "Baseline global",
     "baseline_concept": "Baseline por-concepto",
 }
+NOMBRE_LARGO.update(tabular.MODELOS)
 
 
 def _fmt(m: float, s: float) -> str:
@@ -580,8 +610,8 @@ def main(argv: list[str] | None = None) -> None:
 
     outdir = Path(cfg["outdir"])
     outdir.mkdir(parents=True, exist_ok=True)
-    csv_path = outdir / "model_comparison.csv"
-    md_path = outdir / "model_comparison.md"
+    csv_path = outdir / ("%s.csv" % cfg["outname"])
+    md_path = outdir / ("%s.md" % cfg["outname"])
     meta = {"n_seqs": len(seqs), "n_skills": n_skills, "n_pares": n_pares}
     escribir_csv(resultados, csv_path)
     escribir_markdown(resultados, cfg, meta, md_path)
