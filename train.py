@@ -21,6 +21,7 @@ if "turtle" not in sys.modules:
 
 
 import json
+import random
 import time
 from pathlib import Path
 
@@ -48,6 +49,29 @@ else:
 
 print(f"Dispositivo: {DEVICE}")
 
+# ── Reproducibilidad ──────────────────────────────────────────────────────────
+# Hasta el 23 de septiembre de 2026 este script no fijaba ninguna semilla. Dos
+# corridas con exactamente los mismos datos daban resultados muy distintos: sobre
+# los dos cursos del estudio dieron AUC de test 0.90 y 0.61. Quedaban al azar la
+# inicialización de los pesos y el orden de los lotes, así que ningún
+# entrenamiento era reproducible ni comparable con otro.
+SEED = int(os.environ.get("KT_SEED", "42"))
+random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+try:
+    import numpy as _np
+
+    _np.random.seed(SEED)
+except ImportError:  # numpy siempre está, pero el script no depende de él
+    pass
+
+# Generador propio del DataLoader: sin esto, el barajado del train no se siembra.
+GENERADOR = torch.Generator()
+GENERADOR.manual_seed(SEED)
+print(f"Semilla: {SEED}")
+
 # ── Hiperparámetros ───────────────────────────────────────────────────────────
 # Dataset configurable por env: assist2015 (default) o moodle (data real exportada
 # por export_moodle_to_pykt.py). Permite re-entrenar SAKT sobre conceptos de Moodle.
@@ -69,6 +93,19 @@ BATCH_SIZE = int(os.environ.get("KT_BATCH", "64"))
 EPOCHS = int(os.environ.get("KT_EPOCHS", "200"))
 LR = 1e-3
 PATIENCE = int(os.environ.get("KT_PATIENCE", "20"))
+# Cómo se elige el modelo que se guarda:
+#   "validacion" (por defecto) — el de mayor AUC de validación, con early stopping.
+#   "final"                    — el de la última época, sin early stopping.
+# La segunda existe porque con conjuntos de validación pequeños el máximo del AUC
+# es ruido: el 22 de septiembre una corrida guardó como "mejor modelo" el de la
+# ÉPOCA 1, y ese fue el que quedó sirviendo. Con pocos datos, un presupuesto fijo
+# de épocas es más honesto que elegir el pico de una curva ruidosa.
+SELECCION = os.environ.get("KT_SELECCION", "validacion")
+if SELECCION not in ("validacion", "final"):
+    raise SystemExit(f"KT_SELECCION debe ser 'validacion' o 'final', no {SELECCION!r}")
+# Épocas mínimas antes de que se pueda guardar un checkpoint o cortar por
+# paciencia. Es la guardia directa contra el caso de la época 1.
+MIN_EPOCHS = int(os.environ.get("KT_MIN_EPOCHS", "10"))
 N_FOLDS = 5          # fold 0..4 → usamos fold 4 como validación
 
 OUTPUT_DIR = Path("outputs")
@@ -166,7 +203,9 @@ def get_loaders(n_skills: int):
     valid_ds = KTDatasetCPU(train_file, folds={N_FOLDS - 1})
     test_ds = KTDatasetCPU(test_file, folds={-1})
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, generator=GENERADOR
+    )
     valid_loader = DataLoader(valid_ds, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False)
 
@@ -333,7 +372,14 @@ def main():
         avg_time = (time.time() - train_start) / epoch
         eta_sec = avg_time * (EPOCHS - epoch)
         eta_str = f"{int(eta_sec // 60)}m{int(eta_sec % 60):02d}s"
-        marker = "✓ MEJOR" if val_auc > best_val_auc else f"  sin mejora {patience_counter + 1}/{PATIENCE}"
+        if SELECCION == "final":
+            marker = "presupuesto fijo"
+        elif epoch < MIN_EPOCHS:
+            marker = f"  calentando {epoch}/{MIN_EPOCHS}"
+        elif val_auc > best_val_auc:
+            marker = "✓ MEJOR"
+        else:
+            marker = f"  sin mejora {patience_counter + 1}/{PATIENCE}"
 
         print(
             f"Epoch {epoch:02d}/{EPOCHS} | "
@@ -342,8 +388,12 @@ def main():
             f"{t_elapsed:.0f}s | ETA {eta_str} | {marker}"
         )
 
-        if val_auc > best_val_auc:
-            best_val_auc = val_auc
+        guardar = (
+            (SELECCION == "final" and epoch == EPOCHS)
+            or (SELECCION == "validacion" and val_auc > best_val_auc and epoch >= MIN_EPOCHS)
+        )
+        if guardar:
+            best_val_auc = max(best_val_auc, val_auc)
             patience_counter = 0
             torch.save(
                 {
@@ -366,7 +416,7 @@ def main():
                 },
                 best_model_path,
             )
-        else:
+        elif SELECCION == "validacion" and epoch >= MIN_EPOCHS:
             patience_counter += 1
             if patience_counter >= PATIENCE:
                 print(f"\nEarly stopping en epoch {epoch}.")
